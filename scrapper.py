@@ -1,19 +1,20 @@
 import os
 import re
 import asyncio
+import httpx
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from playwright.async_api import async_playwright
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings  # Обновлённый импорт
 
 # Загружаем переменные окружения
 load_dotenv()
 
 # Конфигурация
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = "nav-2"
+PINECONE_INDEX_NAME = "nav2-docs"
 BASE_URL = "https://docs.nav2.org/"  # Замените на URL вашего сайта
 EMBEDDING_DIMENSION = 1536  # Размерность embeddings (зависит от модели)
 OLLAMA_URL = "http://127.0.0.1:11434/api/embeddings"  # URL для Ollama API
@@ -33,8 +34,8 @@ class Scraper:
         # Проверяем, существует ли индекс в Pinecone
         if PINECONE_INDEX_NAME not in pc.list_indexes().names():
             # Если индекс не существует, выводим в логи
-            print ("Идекс не существует в Pinecone")
-            )
+            print("Индекс не существует в Pinecone")
+            return
 
         # Подключаемся к индексу
         self.pinecone_index = pc.Index(PINECONE_INDEX_NAME)
@@ -102,7 +103,7 @@ class Scraper:
                     {
                         "text": chunk,  # Оригинальный текст
                         "url": url,  # URL страницы
-                        "source": "tech-docs"  # Источник данных
+                        "source": PINECONE_INDEX_NAME  # Источник данных
                     }
                 ))
 
