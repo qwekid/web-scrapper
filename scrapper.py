@@ -2,12 +2,13 @@ import os
 import re
 import asyncio
 import httpx
-from typing import List, Dict, Any
+import random
+from typing import List
 from dotenv import load_dotenv
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 from playwright.async_api import async_playwright
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings  # Обновлённый импорт
+from langchain_ollama import OllamaEmbeddings
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -15,49 +16,39 @@ load_dotenv()
 # Конфигурация
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = "nav2-docs"
-BASE_URL = "https://docs.nav2.org/"  # Замените на URL вашего сайта
-EMBEDDING_DIMENSION = 1536  # Размерность embeddings (зависит от модели)
-OLLAMA_URL = "http://127.0.0.1:11434/api/embeddings"  # URL для Ollama API
+BASE_URL = "https://docs.nav2.org/"
+EMBEDDING_DIMENSION = 1536
+OLLAMA_URL = "http://127.0.0.1:11434/api/embeddings"
 
 # Инициализация Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
+
 class Scraper:
     def __init__(self):
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,  # Размер фрагмента текста
-            chunk_overlap=200,  # Перекрытие между фрагментами
-            length_function=len,
+            chunk_size=1000, chunk_overlap=200, length_function=len
         )
-        self.embeddings = OllamaEmbeddings(model="deepseek-r1")  # Инициализация модели для embeddings
+        self.embeddings = OllamaEmbeddings(model="deepseek-r1")
 
-        # Проверяем, существует ли индекс в Pinecone
         if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-            # Если индекс не существует, выводим в логи
             print("Индекс не существует в Pinecone")
             return
 
-        # Подключаемся к индексу
         self.pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 
     def clean_text(self, text: str) -> str:
-        """Очистка текста от лишних символов и форматирования."""
-        text = re.sub(r'\s+', ' ', text)  # Удаляем лишние пробелы
-        text = re.sub(r'\n+', '\n', text)  # Удаляем лишние переносы строк
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\n+', '\n', text)
         return text.strip()
 
     async def get_embeddings(self, text: str) -> List[float]:
-        """Получение векторных embeddings с помощью Ollama API."""
         data = {
-            "model": "deepseek-r1",  # Используемая модель
-            "prompt": text,
-            "temperature": 0.7,
-            "max_tokens": 100
+            "model": "deepseek-r1", "prompt": text, "temperature": 0.7, "max_tokens": 100
         }
-
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(OLLAMA_URL, json=data, timeout=30.0)
+                response = await client.post(OLLAMA_URL, json=data, timeout=60.0)
                 response.raise_for_status()
                 return response.json().get("embedding", [])
         except Exception as e:
@@ -65,94 +56,86 @@ class Scraper:
             return []
 
     async def get_links(self, page) -> List[str]:
-        """Извлечение всех ссылок на документацию со страницы."""
-        selector = "a"
-        links = await page.locator(selector).evaluate_all("elements => elements.map(e => e.href)")
-        print(f"Найдено ссылок: {len(links)}")
-        return [link for link in links if link.startswith(BASE_URL)]
+        links = await page.locator("a").evaluate_all("elements => elements.map(e => e.href)")
+        return [
+            link for link in links
+            if link.startswith(BASE_URL) and not link.endswith(('.png', '.jpg', '.jpeg', '.gif', '#'))
+        ]
 
     async def scrape_page(self, page, url: str) -> str:
-        """Сбор текста с одной страницы с обработкой перенаправлений."""
         print(f"Обработка страницы: {url}")
-        try:
-            max_redirects = 5  # Максимальное количество перенаправлений
-            current_redirects = 0
+        clean_url = url.split("#")[0]  # Удаляем хэш из URL
 
-            while current_redirects < max_redirects:
-                await page.goto(url, timeout=90000, wait_until="networkidle")
-                if page.url == url:
-                    break  # Перенаправлений больше нет
-                print(f"Перенаправление {current_redirects + 1}: {url} -> {page.url}")
-                url = page.url
-                current_redirects += 1
+        for attempt in range(3):  # Повторяем попытку 3 раза
+            try:
+                # Устанавливаем User-Agent для имитации реального браузера
+                await page.set_extra_http_headers({
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                })
 
-            if current_redirects >= max_redirects:
-                print(f"Достигнуто максимальное количество перенаправлений для {url}")
-                return ""
+                response = await page.goto(clean_url, timeout=900000, wait_until="networkidle")
 
-            # Ожидание загрузки основного контента
-            await page.wait_for_selector("body", timeout=120000)
-
-            # Получение текста страницы
-            content = await page.locator("body").inner_text()
-            return self.clean_text(content)
-        except Exception as e:
-            print(f"Ошибка при загрузке {url}: {e}")
-            return ""
-
-    async def process_page(self, page, url: str):
-        """Обработка одной страницы и загрузка данных в Pinecone."""
-        try:
-            # Сбор текста с текущей страницы
-            content = await self.scrape_page(page, url)
-
-            # Разделение текста на фрагменты
-            chunks = self.text_splitter.split_text(content)
-
-            # Создание векторов и метаданных
-            vectors = []
-            for i, chunk in enumerate(chunks):
-                embedding = await self.get_embeddings(chunk)
-
-                if not embedding:
-                    print(f"Пропуск фрагмента {i} из-за пустого embedding")
+                # Проверка статуса ответа
+                if response and response.status != 200:
+                    print(f"Ошибка: статус {response.status} для {clean_url}")
                     continue
 
+                # Эмуляция поведения пользователя: случайная прокрутка
+                await self.emulate_user_behavior(page)
+
+                content = await page.content()
+                if content:
+                    return self.clean_text(content)
+            except Exception as e:
+                print(f"Ошибка при загрузке {clean_url} (попытка {attempt + 1}): {e}")
+                await asyncio.sleep(5)  # Пауза перед повторной попыткой
+        return ""
+
+    async def emulate_user_behavior(self, page):
+        """Эмуляция поведения пользователя: случайная прокрутка и задержки."""
+        # Случайная прокрутка страницы
+        scroll_steps = random.randint(1, 5)
+        for _ in range(scroll_steps):
+            await page.mouse.wheel(0, random.randint(200, 800))  # Прокрутка вниз
+            await asyncio.sleep(random.uniform(0.5, 2.0))  # Случайная задержка
+
+    async def process_page(self, page, url: str):
+        content = await self.scrape_page(page, url)
+        if not content:
+            print(f"Пропуск страницы {url} из-за отсутствия контента")
+            return
+
+        chunks = self.text_splitter.split_text(content)
+        vectors = []
+
+        for i, chunk in enumerate(chunks):
+            embedding = await self.get_embeddings(chunk)
+            if embedding:
                 vectors.append((
-                    f"{url}-{i}",  # Уникальный ID для фрагмента
-                    embedding,  # Векторное представление текста
-                    {
-                        "text": chunk,  # Оригинальный текст
-                        "url": url,  # URL страницы
-                        "source": PINECONE_INDEX_NAME  # Источник данных
-                    }
+                    f"{url}-{i}", embedding, {"text": chunk, "url": url, "source": PINECONE_INDEX_NAME}
                 ))
 
-            # Загрузка данных в Pinecone
-            if vectors:
-                self.pinecone_index.upsert(vectors=vectors)
-                print(f"Загружено {len(vectors)} фрагментов с {url}")
-
-        except Exception as e:
-            print(f"Ошибка при обработке {url}: {str(e)}")
+        if vectors:
+            self.pinecone_index.upsert(vectors=vectors)
+            print(f"Загружено {len(vectors)} фрагментов с {url}")
 
     async def process_documentation(self):
-        """Основной процесс сбора данных и загрузки в Pinecone."""
         async with async_playwright() as p:
-            # Запуск браузера
-            browser = await p.chromium.launch()
-            page = await browser.new_page()
-            await page.goto(BASE_URL, timeout=90000)  # Переход на главную страницу
+            # Запуск браузера с настройками для имитации реального пользователя
+            browser = await p.chromium.launch(headless=False)  # headless=False для визуального отображения
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            page = await context.new_page()
 
-            # Получаем все ссылки на документацию
+            await page.goto(BASE_URL, timeout=900000, wait_until="networkidle")
             links = await self.get_links(page)
 
-            # Обрабатываем каждую страницу асинхронно
             tasks = [self.process_page(page, url) for url in links]
             await asyncio.gather(*tasks)
 
-            # Закрытие браузера
             await browser.close()
+
 
 if __name__ == "__main__":
     scraper = Scraper()
