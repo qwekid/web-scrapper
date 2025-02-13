@@ -72,12 +72,33 @@ class Scraper:
         return [link for link in links if link.startswith(BASE_URL)]
 
     async def scrape_page(self, page, url: str) -> str:
-        """Сбор текста с одной страницы."""
+        """Сбор текста с одной страницы с обработкой перенаправлений."""
         print(f"Обработка страницы: {url}")
-        await page.goto(url, timeout=90000)
-        await page.wait_for_selector("body", timeout=120000)
-        content = await page.locator("body").inner_text()
-        return self.clean_text(content)
+        try:
+            max_redirects = 5  # Максимальное количество перенаправлений
+            current_redirects = 0
+
+            while current_redirects < max_redirects:
+                await page.goto(url, timeout=90000, wait_until="networkidle")
+                if page.url == url:
+                    break  # Перенаправлений больше нет
+                print(f"Перенаправление {current_redirects + 1}: {url} -> {page.url}")
+                url = page.url
+                current_redirects += 1
+
+            if current_redirects >= max_redirects:
+                print(f"Достигнуто максимальное количество перенаправлений для {url}")
+                return ""
+
+            # Ожидание загрузки основного контента
+            await page.wait_for_selector("body", timeout=120000)
+
+            # Получение текста страницы
+            content = await page.locator("body").inner_text()
+            return self.clean_text(content)
+        except Exception as e:
+            print(f"Ошибка при загрузке {url}: {e}")
+            return ""
 
     async def process_page(self, page, url: str):
         """Обработка одной страницы и загрузка данных в Pinecone."""
